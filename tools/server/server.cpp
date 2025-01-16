@@ -3277,6 +3277,7 @@ struct server_context {
     void receive_cmpl_results_stream(
             const std::unordered_set<int> & id_tasks,
             const std::function<bool(server_task_result_ptr&)> & result_handler,
+            const std::function<void()> & ping_handler,
             const std::function<void(json)> & error_handler,
             const std::function<bool()> & is_connection_closed) {
         size_t n_finished = 0;
@@ -3289,6 +3290,7 @@ struct server_context {
             }
 
             if (result == nullptr) {
+                ping_handler();
                 continue; // retry
             }
 
@@ -5037,6 +5039,9 @@ int main(int argc, char ** argv) {
                     } else {
                         return server_sent_event(sink, res_json);
                     }
+                }, [&]() {
+                    static const std::string ev_keep_alive = ": Keeping connection alive\n\n";
+                    sink.write(ev_keep_alive.data(), ev_keep_alive.size());
                 }, [&](const json & error_data) {
                     server_sent_event(sink, json{{"error", error_data}});
                 }, [&sink]() {
