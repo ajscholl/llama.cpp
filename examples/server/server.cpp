@@ -1590,13 +1590,26 @@ struct server_response {
         }
     }
 
-    // This function blocks the thread until there is a response for one of the id_tasks
-    server_task_result_ptr recv(const std::unordered_set<int> & id_tasks) {
+    // This function blocks the thread until there is a response for one of the id_tasks.
+    // Returns an empty pointer if timeout_millis is not 0 and no result is available before the timeout.
+    server_task_result_ptr recv(const std::unordered_set<int> & id_tasks, int timeout_millis = 0) {
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_results);
-            condition_results.wait(lock, [&]{
-                return !queue_results.empty();
-            });
+            bool has_results;
+            if (timeout_millis > 0) {
+                std::chrono::milliseconds timeout{timeout_millis};
+                has_results = condition_results.wait_for(lock, timeout, [&]{
+                    return !queue_results.empty();
+                });
+            } else {
+                condition_results.wait(lock, [&]{
+                    return !queue_results.empty();
+                });
+                has_results = true;
+            }
+            if (!has_results) {
+                return server_task_result_ptr();
+            }
 
             for (int i = 0; i < (int) queue_results.size(); i++) {
                 if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
@@ -1635,9 +1648,9 @@ struct server_response {
     }
 
     // single-task version of recv()
-    server_task_result_ptr recv(int id_task) {
+    server_task_result_ptr recv(int id_task, int timeout_millis = 0) {
         std::unordered_set<int> id_tasks = {id_task};
-        return recv(id_tasks);
+        return recv(id_tasks, timeout_millis);
     }
 
     // Send a new result to a waiting id_task
@@ -2425,6 +2438,7 @@ struct server_context {
     void receive_cmpl_results_stream(
             const std::unordered_set<int> & id_tasks,
             const std::function<bool(server_task_result_ptr&)> & result_handler,
+            const std::function<void()> & ping_handler,
             const std::function<void(json)> & error_handler,
             const std::function<bool()> & is_connection_closed) {
         size_t n_finished = 0;
@@ -2437,6 +2451,7 @@ struct server_context {
             }
 
             if (result == nullptr) {
+                ping_handler();
                 continue; // retry
             }
 
@@ -3802,6 +3817,9 @@ int main(int argc, char ** argv) {
                     } else {
                         return server_sent_event(sink, "data", res_json);
                     }
+                }, [&]() {
+                    static const std::string ev_keep_alive = ": Keeping connection alive\n\n";
+                    sink.write(ev_keep_alive.data(), ev_keep_alive.size());
                 }, [&](const json & error_data) {
                     server_sent_event(sink, "error", error_data);
                 }, [&sink]() {
