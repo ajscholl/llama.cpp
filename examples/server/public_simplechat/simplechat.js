@@ -401,7 +401,7 @@ class SimpleChat {
                 if (curLine == undefined) {
                     break;
                 }
-                if (curLine.trim() == "") {
+                if (curLine.trim() == "" || curLine.startsWith(":")) {
                     continue;
                 }
                 if (curLine.startsWith("data:")) {
