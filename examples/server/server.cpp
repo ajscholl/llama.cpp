@@ -1702,26 +1702,13 @@ struct server_response {
         }
     }
 
-    // This function blocks the thread until there is a response for one of the id_tasks.
-    // Returns an empty pointer if timeout_millis is not 0 and no result is available before the timeout.
-    server_task_result_ptr recv(const std::unordered_set<int> & id_tasks, int timeout_millis = 0) {
+    // This function blocks the thread until there is a response for one of the id_tasks
+    server_task_result_ptr recv(const std::unordered_set<int> & id_tasks) {
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_results);
-            bool has_results;
-            if (timeout_millis > 0) {
-                std::chrono::milliseconds timeout{timeout_millis};
-                has_results = condition_results.wait_for(lock, timeout, [&]{
-                    return !queue_results.empty();
-                });
-            } else {
-                condition_results.wait(lock, [&]{
-                    return !queue_results.empty();
-                });
-                has_results = true;
-            }
-            if (!has_results) {
-                return server_task_result_ptr();
-            }
+            condition_results.wait(lock, [&]{
+                return !queue_results.empty();
+            });
 
             for (size_t i = 0; i < queue_results.size(); i++) {
                 if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
@@ -1759,9 +1746,9 @@ struct server_response {
     }
 
     // single-task version of recv()
-    server_task_result_ptr recv(int id_task, int timeout_millis = 0) {
+    server_task_result_ptr recv(int id_task) {
         std::unordered_set<int> id_tasks = {id_task};
-        return recv(id_tasks, timeout_millis);
+        return recv(id_tasks);
     }
 
     // Send a new result to a waiting id_task
