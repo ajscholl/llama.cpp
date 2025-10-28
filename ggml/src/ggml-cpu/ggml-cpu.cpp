@@ -9,6 +9,7 @@
 #include <cctype>
 #include <string>
 #include <vector>
+#include <cstdio>
 
 #ifdef GGML_USE_CPU_HBM
 #    include "hbm.h"
@@ -348,6 +349,23 @@ static const char * ggml_backend_cpu_device_get_description(ggml_backend_dev_t d
     return ctx->description.c_str();
 }
 
+static size_t get_cgroup_mem_limit(const char *cgroup_path_v2, const char *cgroup_path_v1) {
+    FILE *f = fopen(cgroup_path_v2, "r");
+    if (!f) {
+        f = fopen(cgroup_path_v1, "r");
+    }
+
+    if (!f) {
+        return 0;
+    }
+
+    size_t limit = 0;
+    fscanf(f, "%zu", &limit);
+    fclose(f);
+
+    return (limit == (size_t)-1 || limit > (1ULL<<60)) ? 0 : limit; // ignore "max"
+}
+
 static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
 #ifdef _WIN32
     MEMORYSTATUSEX status;
@@ -356,6 +374,27 @@ static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * 
     *total = status.ullTotalPhys;
     *free = status.ullAvailPhys;
 #else
+    size_t hard_limit = get_cgroup_mem_limit("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    size_t soft_limit = get_cgroup_mem_limit("/sys/fs/cgroup/memory.low", "/sys/fs/cgroup/memory/memory.soft_limit_in_bytes");
+
+    if (hard_limit > 0) {
+        if (soft_limit > 0 && soft_limit < hard_limit) {
+            *total = soft_limit;
+            *free = soft_limit;
+            return;
+        }
+
+        *total = hard_limit;
+        *free = hard_limit;
+        return;
+    }
+
+    if (soft_limit > 0) {
+        *total = soft_limit;
+        *free = soft_limit;
+        return;
+    }
+
     long pages = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGE_SIZE);
     *total = pages * page_size;
