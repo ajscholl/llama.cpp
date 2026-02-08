@@ -9,6 +9,7 @@
 #include <cctype>
 #include <string>
 #include <vector>
+#include <cstdio>
 
 #ifdef GGML_USE_CPU_HBM
 #    include "hbm.h"
@@ -360,6 +361,53 @@ static const char * ggml_backend_cpu_device_get_description(ggml_backend_dev_t d
     return ctx->description.c_str();
 }
 
+static size_t get_cgroup_mem_limit(const char *cgroup_path_v2, const char *cgroup_path_v1) {
+    FILE *f = fopen(cgroup_path_v2, "r");
+    if (!f) {
+        f = fopen(cgroup_path_v1, "r");
+    }
+
+    if (!f) {
+        return 0;
+    }
+
+    size_t limit = 0;
+    fscanf(f, "%zu", &limit);
+    fclose(f);
+
+    return (limit == (size_t)-1 || limit > (1ULL<<60)) ? 0 : limit; // ignore "max"
+}
+
+static size_t parse_human_size(const char *str) {
+    if (!str || !*str) {
+        return 0;
+    }
+
+    char *end;
+    double val = strtod(str, &end);
+    while (isspace((unsigned char)*end)) {
+        end++;
+    }
+
+    switch (tolower((unsigned char)*end)) {
+        case 't': return (size_t)(val * 1024 * 1024 * 1024 * 1024);
+        case 'g': return (size_t)(val * 1024 * 1024 * 1024);
+        case 'm': return (size_t)(val * 1024 * 1024);
+        case 'k': return (size_t)(val * 1024);
+        default:  return (size_t)val;
+    }
+}
+
+static size_t get_env_mem_limit() {
+    const char *env = getenv("GGML_MEMORY_LIMIT");
+    if (!env) {
+        return 0;
+    }
+
+    return parse_human_size(env);
+}
+
+
 static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
 #ifdef _WIN32
     MEMORYSTATUSEX status;
@@ -368,9 +416,26 @@ static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * 
     *total = status.ullTotalPhys;
     *free = status.ullAvailPhys;
 #else
+    size_t soft_limit = get_cgroup_mem_limit("/sys/fs/cgroup/memory.low", "/sys/fs/cgroup/memory/memory.soft_limit_in_bytes");
+    size_t hard_limit = get_cgroup_mem_limit("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    size_t env_limit = get_env_mem_limit();
+
     long pages = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGE_SIZE);
-    *total = pages * page_size;
+    size_t physical_limit = pages * page_size;
+
+    size_t limit = soft_limit;
+    if (limit == 0 || (hard_limit > 0 && hard_limit < limit)) {
+        limit = hard_limit;
+    }
+    if (limit == 0 || (env_limit > 0 && env_limit < limit)) {
+        limit = env_limit;
+    }
+    if (limit == 0 || (physical_limit > 0 && physical_limit < limit)) {
+        limit = physical_limit;
+    }
+
+    *total = limit;
 
     // "free" system memory is ill-defined, for practical purposes assume that all of it is free:
     *free = *total;
