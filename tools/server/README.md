@@ -704,6 +704,51 @@ If the tokens are missing, then the extra context is simply prefixed at the star
 [input_extra]<FIM_PRE>[input_prefix]<FIM_SUF>[input_suffix]<FIM_MID>[prompt]
 ```
 
+### POST `/v1/chunk`: Hierarchical token-aware chunking
+
+This endpoint chunks a document into `big` chunks containing `small` chunks. It evaluates the document with the model and uses per-token probabilities for two split tokens to choose boundaries; it does not generate completion text.
+
+*Options:*
+
+- `document` (required): input text to chunk.
+- `small_target_tokens`, `small_min_tokens`, `small_max_tokens`: token-size controls for small chunks. Defaults: `128`, `64`, `256`.
+- `big_target_tokens`, `big_min_tokens`, `big_max_tokens`: token-size controls for big chunks. Defaults: `1024`, `512`, `2048`.
+- `big_split_token`, `small_split_token`: optional split marker tokens used internally for boundary scoring. Defaults: `段`, `顿`.
+
+**Response format**
+
+```json
+{
+  "chunks": [
+    {
+      "start_token": 0,
+      "end_token": 123,
+      "token_count": 123,
+      "small_chunks": [
+        {
+          "text": "...",
+          "start_token": 0,
+          "end_token": 31,
+          "token_count": 31
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "small_split_token_id": 0,
+    "big_split_token_id": 0,
+    "small_target_tokens": 128,
+    "small_min_tokens": 64,
+    "small_max_tokens": 256,
+    "big_target_tokens": 1024,
+    "big_min_tokens": 512,
+    "big_max_tokens": 2048
+  }
+}
+```
+
+`"".join(all_small_chunks_text)` is guaranteed to reconstruct the input `document`.
+
 ### **GET** `/props`: Get server global properties.
 
 By default, it is read-only. To make POST request to change global properties, you need to start server with `--props`
