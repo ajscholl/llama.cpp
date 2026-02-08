@@ -30,6 +30,166 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+static bool chunk_is_preferred_break(const std::string & token_piece) {
+    if (token_piece.empty()) {
+        return false;
+    }
+
+    for (size_t i = token_piece.size(); i > 0; --i) {
+        const unsigned char ch = (unsigned char) token_piece[i - 1];
+        if (ch == ' ' || ch == '\t') {
+            continue;
+        }
+        return ch == '\n' || ch == '.' || ch == '!' || ch == '?' || ch == ';' || ch == ':' || ch == ')' || ch == ']' ||
+               ch == '}' || ch == '>';
+    }
+
+    return false;
+}
+
+struct chunk_split {
+    int  token_boundary = 0;
+    bool is_big         = false;
+};
+
+static std::vector<chunk_split> chunk_choose_splits(const std::vector<std::string> & pieces,
+                                                    const std::vector<int> &         offsets,
+                                                    const std::vector<float> &       big_lp,
+                                                    const std::vector<float> &       small_lp,
+                                                    int                              min_big_tokens,
+                                                    int                              min_small_tokens,
+                                                    float                            big_lp_threshold,
+                                                    float                            small_lp_threshold) {
+    const int                n = (int) pieces.size();
+    std::vector<chunk_split> splits;
+    if (n == 0) {
+        return splits;
+    }
+
+    int last_big_at   = 0;
+    int last_small_at = 0;
+
+    for (int i = 1; i <= n; ++i) {
+        const bool can_big   = (i - last_big_at) >= min_big_tokens;
+        const bool can_small = (i - last_small_at) >= min_small_tokens;
+        const bool preferred = chunk_is_preferred_break(pieces[i - 1]);
+
+        bool big_ok   = can_big && (big_lp[i - 1] >= big_lp_threshold);
+        bool small_ok = can_small && (small_lp[i - 1] >= small_lp_threshold);
+
+        if (!preferred) {
+            big_ok   = can_big && (big_lp[i - 1] >= (big_lp_threshold + 1.0f));
+            small_ok = can_small && (small_lp[i - 1] >= (small_lp_threshold + 0.7f));
+        }
+
+        if (big_ok) {
+            splits.push_back({ i, true });
+            last_big_at   = i;
+            last_small_at = i;
+        } else if (small_ok) {
+            splits.push_back({ i, false });
+            last_small_at = i;
+        }
+    }
+
+    if (splits.empty()) {
+        constexpr int FALLBACK_SMALL_EVERY_BYTES = 200;
+        constexpr int FALLBACK_BIG_EVERY_BYTES   = 1500;
+
+        int next_small = FALLBACK_SMALL_EVERY_BYTES;
+        int next_big   = FALLBACK_BIG_EVERY_BYTES;
+
+        for (int i = 1; i <= n; ++i) {
+            const int  pos       = offsets[i];
+            const bool preferred = chunk_is_preferred_break(pieces[i - 1]);
+
+            if (pos >= next_big && preferred) {
+                splits.push_back({ i, true });
+                next_big += FALLBACK_BIG_EVERY_BYTES;
+                next_small = std::max(next_small, pos + FALLBACK_SMALL_EVERY_BYTES);
+            } else if (pos >= next_small && preferred) {
+                splits.push_back({ i, false });
+                next_small += FALLBACK_SMALL_EVERY_BYTES;
+            }
+        }
+    }
+
+    return splits;
+}
+
+static llama_token chunk_find_token_id(const llama_vocab * vocab, const std::string & token) {
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    for (llama_token id = 0; id < n_vocab; ++id) {
+        if (common_token_to_piece(vocab, id) == token) {
+            return id;
+        }
+    }
+    return LLAMA_TOKEN_NULL;
+}
+
+static std::string chunk_build_prefix_prompt(const std::string & big_token,
+                                             const std::string & small_token,
+                                             const std::string & user_message) {
+    std::string system_message =
+        "Your job is to act as a \"Chunker\", for use in RAG pipelines. The user will provide a long document.\n"
+        "You, the assistant, should repeat the exact same message verbatim, EXCEPT you should insert split tokens "
+        "throughout the passage.\n\n"
+        "Instructions\n\n"
+        "- For big splits, please use `{BIG_SPLIT_TOKEN}` as the \"big split token\" separator.\n"
+        "- For small splits, please use `{SMALL_SPLIT_TOKEN}` as the \"small split token\" separator.\n"
+        "- In general text documents, small splits are typically per sentence, and big splits are typically per "
+        "section.\n"
+        "- When a section header defines a section, insert the big split BEFORE the header.\n\n"
+        "General splitting rules\n\n"
+        "- You may get a user message that is unstructured or not structured cleanly. Still try to split that input as "
+        "best as you can, even if it just means doing a small split every 100 characters and a big split every 500 "
+        "characters.\n"
+        "- Prefer to wait until the end of a newline or a sentence-ending punctuation mark to insert a split, rather "
+        "than breaking one or two tokens before that.\n"
+        "- If there are no newlines or sentence boundaries, choose other reasonable breakpoints.\n"
+        "- Your input could be anything: prose, code, HTML, markdown, logs, etc. You MUST output SOME split regardless "
+        "of the input. Pick something reasonable.\n\n"
+        "Code-specific rules\n\n"
+        "- For programming code, insert a small split after logical units such as lines or code blocks.\n"
+        "- Insert a big split after higher-level structures such as function definitions, class definitions, or major "
+        "sections.\n\n"
+        "HTML-specific rules\n\n"
+        "- Insert a small split token after every closing tag and after complete sentences.\n"
+        "- Insert a big split token after the closing tag of an important structural element (for example: article, "
+        "section, main, nav, header, footer).\n\n"
+        "Fiction / novel splitting rules\n\n"
+        "- If the document appears to be fiction (narrative prose, dialogue, chapters), treat a big split as a chapter "
+        "or clear scene break, and treat a small split as a narrative beat within a scene.\n"
+        "- Insert a big split at:\n"
+        "  - the start of a chapter (e.g., \"Chapter X\", \"CHAPTER\", roman numerals),\n"
+        "  - explicit scene break markers such as `***`, `* * *`, `- - -`, `#`, or similar separators,\n"
+        "  - a clear change in point of view, location, or time jump (e.g., \"Later that night...\", \"Meanwhile...\", "
+        "\"Two weeks earlier...\"), preferably at a paragraph boundary.\n"
+        "- Insert a small split at:\n"
+        "  - the end of a paragraph,\n"
+        "  - the end of a complete dialogue exchange (after any following narration beat),\n"
+        "  - the end of a sentence only if paragraphs are extremely long; otherwise prefer paragraph-level splits for "
+        "fiction.\n"
+        "- Avoid placing splits:\n"
+        "  - inside a quoted line of dialogue,\n"
+        "  - between an opening quotation mark and its corresponding closing quotation mark,\n"
+        "  - in the middle of a paragraph unless the paragraph is very long and you split at a sentence boundary,\n"
+        "  - in the middle of an em-dash interruption or between an interruption and its continuation.\n"
+        "- Prefer narrative cohesion: fewer, larger chunks are better than many small ones. When in doubt, split at "
+        "paragraph boundaries; reserve big splits for chapter or scene boundaries.\n\n"
+        "Additional notes\n\n"
+        "- You may sometimes not see your own previously inserted split tokens in the text you are processing. That is "
+        "expected.\n"
+        "- You MUST continue to attempt to insert split tokens according to these rules regardless.\n";
+
+    string_replace_all(system_message, "{BIG_SPLIT_TOKEN}", big_token);
+    string_replace_all(system_message, "{SMALL_SPLIT_TOKEN}", small_token);
+
+    return "<|start_header_id|>system<|end_header_id|>" + system_message + "<|eot_id|>" +
+           "<|start_header_id|>user<|end_header_id|>" + user_message + "<|eot_id|>" +
+           "<|start_header_id|>assistant<|end_header_id|>\n\n";
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -86,6 +246,9 @@ struct server_slot {
     std::vector<int32_t> i_batch_dft;
 
     std::vector<completion_token_output> generated_token_probs;
+
+    std::vector<float> chunk_big_logprobs;
+    std::vector<float> chunk_small_logprobs;
 
     bool has_next_token = true;
     bool has_new_line   = false;
@@ -1363,6 +1526,32 @@ private:
         }
     }
 
+    float token_logprob_at(llama_context * ctx_in, int idx, llama_token token_id) const {
+        const auto * logits   = llama_get_logits_ith(ctx_in, idx);
+        const int    n_logits = llama_get_sampled_logits_count_ith(ctx_in, idx);
+
+        if (logits == nullptr || n_logits <= 0 || token_id < 0 || token_id >= n_logits) {
+            return -std::numeric_limits<float>::infinity();
+        }
+
+        float max_logit = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < n_logits; ++i) {
+            max_logit = std::max(max_logit, logits[i]);
+        }
+
+        double sum_exp = 0.0;
+        for (int i = 0; i < n_logits; ++i) {
+            sum_exp += std::exp((double) logits[i] - max_logit);
+        }
+
+        if (sum_exp <= 0.0) {
+            return -std::numeric_limits<float>::infinity();
+        }
+
+        const double logsumexp = max_logit + std::log(sum_exp);
+        return (float) ((double) logits[token_id] - logsumexp);
+    }
+
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
         send_error(task.id, error, type);
     }
@@ -1660,6 +1849,7 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_CHUNK:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -2277,6 +2467,10 @@ private:
 
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
                                 }
+
+                                if (slot.task->type == SERVER_TASK_TYPE_CHUNK) {
+                                    n_past = std::min(n_past, slot.task->chunking.prefix_n_tokens);
+                                }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
@@ -2503,12 +2697,12 @@ private:
                             break;
                         }
 
-                        // embedding requires all tokens in the batch to be output
+                        // embedding/chunking require all prompt-token logits
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
-                            slot.task->need_embd());
+                            slot.task->need_embd() || slot.task->type == SERVER_TASK_TYPE_CHUNK);
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -2704,6 +2898,25 @@ private:
                 }
             }
 
+            // collect per-token split-token logprobs for chunking tasks during prompt processing
+            for (auto & slot : slots) {
+                if (!slot.task || slot.task->type != SERVER_TASK_TYPE_CHUNK) {
+                    continue;
+                }
+
+                for (int32_t j = 0; j < n_tokens; ++j) {
+                    if (!batch_view.logits[j] || batch_view.seq_id[j][0] != slot.id) {
+                        continue;
+                    }
+
+                    const int idx = j;
+                    slot.chunk_big_logprobs.push_back(
+                        token_logprob_at(ctx, idx, slot.task->chunking.big_split_token_id));
+                    slot.chunk_small_logprobs.push_back(
+                        token_logprob_at(ctx, idx, slot.task->chunking.small_split_token_id));
+                }
+            }
+
             for (auto & slot : slots) {
                 // optionally send prompt processing progress
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -2730,6 +2943,158 @@ private:
                         slot.release();
                         slot.i_batch = -1;
                         continue; // continue loop of slots
+                    }
+
+                    if (slot.task->type == SERVER_TASK_TYPE_CHUNK) {
+                        auto res_chunk   = std::make_unique<server_task_result_chunk>();
+                        res_chunk->id    = slot.task->id;
+                        res_chunk->index = slot.task->index;
+
+                        const auto &         chunking   = slot.task->chunking;
+                        const llama_tokens & all_tokens = slot.task->tokens.get_text_tokens();
+                        const int            n_all      = (int) all_tokens.size();
+                        const int            n_prefix   = chunking.prefix_n_tokens;
+
+                        if (n_prefix < 0 || n_prefix > n_all) {
+                            send_error(slot, "invalid chunking prefix token count", ERROR_TYPE_SERVER);
+                            slot.release();
+                            slot.i_batch = -1;
+                            continue;
+                        }
+
+                        const int n_cached = slot.n_prompt_tokens_cache;
+                        const int n_expected = n_all - n_cached;
+                        if ((int) slot.chunk_big_logprobs.size() < n_expected ||
+                            (int) slot.chunk_small_logprobs.size() < n_expected) {
+                            send_error(slot, "chunking logprob collection is incomplete", ERROR_TYPE_SERVER);
+                            slot.release();
+                            slot.i_batch = -1;
+                            continue;
+                        }
+
+                        const int    n_doc = n_all - n_prefix;
+                        llama_tokens doc_tokens;
+                        doc_tokens.reserve(n_doc);
+                        for (int t = n_prefix; t < n_all; ++t) {
+                            doc_tokens.push_back(all_tokens[t]);
+                        }
+
+                        std::vector<float> big_logprobs;
+                        std::vector<float> small_logprobs;
+                        big_logprobs.reserve(n_doc);
+                        small_logprobs.reserve(n_doc);
+                        for (int t = n_prefix; t < n_all; ++t) {
+                            const int idx = t - n_cached;
+                            big_logprobs.push_back(slot.chunk_big_logprobs[idx]);
+                            small_logprobs.push_back(slot.chunk_small_logprobs[idx]);
+                        }
+
+                        std::vector<std::string> token_pieces;
+                        token_pieces.reserve(n_doc);
+                        for (int t = 0; t < n_doc; ++t) {
+                            token_pieces.push_back(common_token_to_piece(vocab, doc_tokens[t]));
+                        }
+
+                        std::vector<int> offsets;
+                        offsets.reserve((size_t) n_doc + 1);
+                        offsets.push_back(0);
+                        int bytes_total = 0;
+                        for (int t = 0; t < n_doc; ++t) {
+                            bytes_total += (int) token_pieces[t].size();
+                            offsets.push_back(bytes_total);
+                        }
+
+                        const auto splits =
+                            chunk_choose_splits(token_pieces, offsets, big_logprobs, small_logprobs,
+                                                chunking.big_min_tokens, chunking.small_min_tokens,
+                                                chunking.big_logprob_threshold, chunking.small_logprob_threshold);
+
+                        std::set<int> all_small_bounds_set;
+                        std::set<int> big_bounds_set;
+                        all_small_bounds_set.insert(0);
+                        all_small_bounds_set.insert(n_doc);
+                        big_bounds_set.insert(0);
+                        big_bounds_set.insert(n_doc);
+
+                        for (const auto & split : splits) {
+                            all_small_bounds_set.insert(split.token_boundary);
+                            if (split.is_big) {
+                                big_bounds_set.insert(split.token_boundary);
+                            }
+                        }
+
+                        std::vector<int> all_small_bounds(all_small_bounds_set.begin(), all_small_bounds_set.end());
+                        std::vector<int> big_bounds(big_bounds_set.begin(), big_bounds_set.end());
+
+                        std::string reconstructed;
+                        reconstructed.reserve(chunking.document.size());
+
+                        json small_chunks_json = json::array();
+                        for (size_t bi = 1; bi < all_small_bounds.size(); ++bi) {
+                            const int   s = all_small_bounds[bi - 1];
+                            const int   e = all_small_bounds[bi];
+                            std::string text;
+                            for (int t = s; t < e; ++t) {
+                                text += token_pieces[t];
+                            }
+                            reconstructed += text;
+                            small_chunks_json.push_back(json{
+                                { "text",        text  },
+                                { "start_token", s     },
+                                { "end_token",   e     },
+                                { "token_count", e - s },
+                            });
+                        }
+
+                        if (reconstructed != chunking.document) {
+                            send_error(slot, "document reconstruction mismatch after tokenization",
+                                       ERROR_TYPE_INVALID_REQUEST);
+                            slot.release();
+                            slot.i_batch = -1;
+                            continue;
+                        }
+
+                        json big_chunks_json = json::array();
+                        for (size_t bi = 1; bi < big_bounds.size(); ++bi) {
+                            const int bs = big_bounds[bi - 1];
+                            const int be = big_bounds[bi];
+
+                            json children = json::array();
+                            for (const auto & sc : small_chunks_json) {
+                                const int ss = sc.at("start_token");
+                                const int se = sc.at("end_token");
+                                if (ss >= bs && se <= be) {
+                                    children.push_back(sc);
+                                }
+                            }
+
+                            big_chunks_json.push_back(json{
+                                { "start_token",  bs                  },
+                                { "end_token",    be                  },
+                                { "token_count",  be - bs             },
+                                { "small_chunks", std::move(children) },
+                            });
+                        }
+
+                        res_chunk->chunk_data = json{
+                            { "chunks", std::move(big_chunks_json) },
+                            { "meta",
+                             {
+                                  { "small_split_token_id", chunking.small_split_token_id },
+                                  { "big_split_token_id", chunking.big_split_token_id },
+                                  { "small_target_tokens", chunking.small_target_tokens },
+                                  { "small_min_tokens", chunking.small_min_tokens },
+                                  { "small_max_tokens", chunking.small_max_tokens },
+                                  { "big_target_tokens", chunking.big_target_tokens },
+                                  { "big_min_tokens", chunking.big_min_tokens },
+                                  { "big_max_tokens", chunking.big_max_tokens },
+                              }                                    }
+                        };
+
+                        queue_results.send(std::move(res_chunk));
+                        slot.release();
+                        slot.i_batch = -1;
+                        continue;
                     }
 
                     GGML_ASSERT(slot.task->need_sampling());
@@ -3847,6 +4212,110 @@ void server_routes::init_routes() {
             top_n);
 
         res->ok(root);
+        return res;
+    };
+
+    this->post_chunk = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (ctx_server.mctx != nullptr) {
+            res->error(format_error_response("This server does not support /v1/chunk with multimodal models",
+                                             ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const json        body     = json::parse(req.body);
+        const std::string document = json_value(body, "document", std::string());
+        if (document.empty()) {
+            res->error(format_error_response("\"document\" must be a non-empty string", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const std::string big_split_token   = json_value(body, "big_split_token", std::string("\u6bb5"));
+        const std::string small_split_token = json_value(body, "small_split_token", std::string("\u987f"));
+
+        const int small_target_tokens = json_value(body, "small_target_tokens", 128);
+        const int small_min_tokens    = json_value(body, "small_min_tokens", 64);
+        const int small_max_tokens    = json_value(body, "small_max_tokens", 256);
+        const int big_target_tokens   = json_value(body, "big_target_tokens", 1024);
+        const int big_min_tokens      = json_value(body, "big_min_tokens", 512);
+        const int big_max_tokens      = json_value(body, "big_max_tokens", 2048);
+
+        auto check_range = [](int min_v, int target_v, int max_v) {
+            return min_v > 0 && target_v > 0 && max_v > 0 && min_v <= target_v && target_v <= max_v;
+        };
+
+        if (!check_range(small_min_tokens, small_target_tokens, small_max_tokens)) {
+            res->error(format_error_response("invalid small chunk token range: require 0 < min <= target <= max",
+                                             ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!check_range(big_min_tokens, big_target_tokens, big_max_tokens)) {
+            res->error(format_error_response("invalid big chunk token range: require 0 < min <= target <= max",
+                                             ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const float big_logprob_threshold   = json_value(body, "big_logprob_threshold", -4.0f);
+        const float small_logprob_threshold = json_value(body, "small_logprob_threshold", -3.0f);
+        const float preferred_big_bonus     = json_value(body, "preferred_big_bonus", 0.35f);
+        const float preferred_small_bonus   = json_value(body, "preferred_small_bonus", 0.25f);
+
+        const llama_token big_split_token_id   = chunk_find_token_id(ctx_server.vocab, big_split_token);
+        const llama_token small_split_token_id = chunk_find_token_id(ctx_server.vocab, small_split_token);
+        if (big_split_token_id == LLAMA_TOKEN_NULL || small_split_token_id == LLAMA_TOKEN_NULL) {
+            res->error(format_error_response("split token not found as standalone tokenizer piece",
+                                             ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const std::string prefix_prompt = chunk_build_prefix_prompt(big_split_token, small_split_token, document);
+        llama_tokens      prefix_tokens = tokenize_mixed(ctx_server.vocab, prefix_prompt, true, true);
+        llama_tokens      doc_tokens    = tokenize_mixed(ctx_server.vocab, document, false, false);
+
+        if (doc_tokens.empty()) {
+            res->error(format_error_response("\"document\" tokenized to empty input", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        llama_tokens all_tokens = prefix_tokens;
+        all_tokens.insert(all_tokens.end(), doc_tokens.begin(), doc_tokens.end());
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_CHUNK);
+            task.id                               = rd.get_new_id();
+            task.tokens                           = server_tokens(all_tokens, false);
+            task.chunking.document                = document;
+            task.chunking.prefix_n_tokens         = (int) prefix_tokens.size();
+            task.chunking.big_split_token_id      = big_split_token_id;
+            task.chunking.small_split_token_id    = small_split_token_id;
+            task.chunking.small_target_tokens     = small_target_tokens;
+            task.chunking.small_min_tokens        = small_min_tokens;
+            task.chunking.small_max_tokens        = small_max_tokens;
+            task.chunking.big_target_tokens       = big_target_tokens;
+            task.chunking.big_min_tokens          = big_min_tokens;
+            task.chunking.big_max_tokens          = big_max_tokens;
+            task.chunking.big_logprob_threshold   = big_logprob_threshold;
+            task.chunking.small_logprob_threshold = small_logprob_threshold;
+            task.chunking.preferred_big_bonus     = preferred_big_bonus;
+            task.chunking.preferred_small_bonus   = preferred_small_bonus;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(dynamic_cast<server_task_result_chunk *>(result.get()) != nullptr);
+        res->ok(result->to_json());
         return res;
     };
 

@@ -17,6 +17,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
+    SERVER_TASK_TYPE_CHUNK,
     SERVER_TASK_TYPE_INFILL,
     SERVER_TASK_TYPE_CANCEL,
     SERVER_TASK_TYPE_NEXT_RESPONSE,
@@ -164,6 +165,29 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_CHUNK
+    struct chunking_params {
+        llama_token big_split_token_id   = LLAMA_TOKEN_NULL;
+        llama_token small_split_token_id = LLAMA_TOKEN_NULL;
+
+        std::string document;
+        int         prefix_n_tokens = 0;
+
+        int small_target_tokens = 128;
+        int small_min_tokens    = 64;
+        int small_max_tokens    = 256;
+
+        int big_target_tokens = 1024;
+        int big_min_tokens    = 512;
+        int big_max_tokens    = 2048;
+
+        float big_logprob_threshold   = -4.0f;
+        float small_logprob_threshold = -3.0f;
+
+        float preferred_big_bonus   = 0.35f;
+        float preferred_small_bonus = 0.25f;
+    } chunking;
 
     server_task() = default;
 
@@ -472,6 +496,12 @@ struct server_task_result_rerank : server_task_result {
     float score = -1e6;
 
     int32_t n_tokens;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_chunk : server_task_result {
+    json chunk_data;
 
     virtual json to_json() override;
 };

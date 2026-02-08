@@ -1726,6 +1726,13 @@ json server_task_result_rerank::to_json() {
 }
 
 //
+// server_task_result_chunk
+//
+json server_task_result_chunk::to_json() {
+    return chunk_data;
+}
+
+//
 // server_task_result_error
 //
 json server_task_result_error::to_json() {
