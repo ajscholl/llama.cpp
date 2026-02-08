@@ -253,3 +253,22 @@ def test_router_reload_models():
         assert "model-reload-c" in ids, "newly added model should appear"
     finally:
         os.remove(preset_path)
+
+def test_router_chunk_endpoint():
+    global server
+    server.start()
+
+    model_id = "ggml-org/tinygemma3-GGUF:Q8_0"
+    document = "Section A. First sentence. Second sentence.\nSection B. Third sentence."
+
+    res = server.make_request("POST", "/v1/chunk", data={
+        "model": model_id,
+        "document": document,
+    })
+
+    assert res.status_code == 200
+    assert "chunks" in res.body
+    small_chunks = []
+    for big in res.body["chunks"]:
+        small_chunks.extend(big["small_chunks"])
+    assert "".join(chunk["text"] for chunk in small_chunks) == document
