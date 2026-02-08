@@ -896,12 +896,9 @@ static struct llama_model * llama_model_load_from_file_impl(
         params.progress_callback = [](float progress, void * ctx) {
             unsigned * cur_percentage_p = (unsigned *) ctx;
             unsigned percentage = (unsigned) (100 * progress);
-            while (percentage > *cur_percentage_p) {
+            if (percentage > *cur_percentage_p) {
                 *cur_percentage_p = percentage;
-                LLAMA_LOG_CONT(".");
-                if (percentage >= 100) {
-                    LLAMA_LOG_CONT("\n");
-                }
+                LLAMA_LOG_CONT("Loading model: %u%%\n", percentage);
             }
             return true;
         };
