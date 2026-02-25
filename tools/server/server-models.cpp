@@ -92,6 +92,7 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_API_KEY");
     preset.unset_option("LLAMA_ARG_MODELS_DIR");
     preset.unset_option("LLAMA_ARG_MODELS_MAX");
+    preset.unset_option("LLAMA_ARG_MODELS_MAX_WEIGHT");
     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
     if (unset_model_args) {
@@ -211,6 +212,20 @@ void server_models::load_models() {
     if (!base_params.models_preset.empty()) {
         custom_presets = ctx_preset.load_from_ini(base_params.models_preset, global);
         SRV_INF("Loaded %zu custom model presets from %s\n", custom_presets.size(), base_params.models_preset.c_str());
+
+        if (base_params.models_max_weight <= 0) {
+            std::string val;
+            if (global.get_option("LLAMA_ARG_MODELS_MAX_WEIGHT", val)) {
+                try {
+                    base_params.models_max_weight = std::stoi(val);
+                } catch (...) {
+                    throw std::runtime_error(string_format(
+                        "invalid models-max-weight value '%s' in global preset",
+                        val.c_str()
+                    ));
+                }
+            }
+        }
     }
 
     // cascade, apply global preset first
@@ -255,6 +270,7 @@ void server_models::load_models() {
             /* args         */ std::vector<std::string>(),
             /* exit_code    */ 0,
             /* stop_timeout */ DEFAULT_STOP_TIMEOUT,
+            /* weight       */ 1,
         };
         add_model(std::move(meta));
     }
@@ -284,21 +300,47 @@ void server_models::load_models() {
                 inst.meta.stop_timeout = DEFAULT_STOP_TIMEOUT;
             }
         }
+
+        if (inst.meta.preset.get_option(COMMON_ARG_PRESET_MODEL_WEIGHT, val)) {
+            try {
+                inst.meta.weight = std::stoi(val);
+            } catch (...) {
+                throw std::runtime_error(string_format(
+                    "invalid model-weight value '%s' for model '%s'",
+                    val.c_str(), name.c_str()
+                ));
+            }
+            if (inst.meta.weight <= 0) {
+                throw std::runtime_error(string_format(
+                    "model-weight must be > 0 for model '%s'",
+                    name.c_str()
+                ));
+            }
+        }
     }
 
     // load any autoload models
     std::vector<std::string> models_to_load;
+    int64_t startup_weight = 0;
     for (const auto & [name, inst] : mapping) {
         std::string val;
         if (inst.meta.preset.get_option(COMMON_ARG_PRESET_LOAD_ON_STARTUP, val)) {
             models_to_load.push_back(name);
+            startup_weight += inst.meta.weight;
         }
     }
-    if ((int)models_to_load.size() > base_params.models_max) {
+    if (base_params.models_max > 0 && (int)models_to_load.size() > base_params.models_max) {
         throw std::runtime_error(string_format(
             "number of models to load on startup (%zu) exceeds models_max (%d)",
             models_to_load.size(),
             base_params.models_max
+        ));
+    }
+    if (base_params.models_max_weight > 0 && startup_weight > base_params.models_max_weight) {
+        throw std::runtime_error(string_format(
+            "combined model weight to load on startup (%lld) exceeds models_max_weight (%d)",
+            (long long) startup_weight,
+            base_params.models_max_weight
         ));
     }
     for (const auto & name : models_to_load) {
@@ -412,36 +454,64 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     return result;
 }
 
-void server_models::unload_lru() {
-    if (base_params.models_max <= 0) {
+void server_models::unload_lru_until_fit(const std::string & model_name) {
+    if (base_params.models_max <= 0 && base_params.models_max_weight <= 0) {
         return; // no limit
     }
-    // remove one of the servers if we passed the models_max (least recently used - LRU)
-    std::string lru_model_name = "";
-    int64_t lru_last_used = ggml_time_ms();
-    size_t count_active = 0;
-    {
-        std::unique_lock<std::mutex> lk(mutex);
-        for (const auto & m : mapping) {
-            if (m.second.meta.is_active()) {
-                count_active++;
-                if (m.second.meta.last_used < lru_last_used) {
-                    lru_model_name = m.first;
-                    lru_last_used = m.second.meta.last_used;
-                }
-            }
-        }
-    }
-    if (!lru_model_name.empty() && count_active >= (size_t)base_params.models_max) {
-        SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
-        unload(lru_model_name);
-        // wait for unload to complete
+
+    while (true) {
+        std::string lru_model_name = "";
+        int64_t lru_last_used = ggml_time_ms();
         {
             std::unique_lock<std::mutex> lk(mutex);
-            cv.wait(lk, [this, &lru_model_name]() {
-                return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
-            });
+
+            auto it_target = mapping.find(model_name);
+            if (it_target == mapping.end()) {
+                throw std::runtime_error("model name=" + model_name + " is not found");
+            }
+
+            const auto & target = it_target->second.meta;
+            if (target.is_active()) {
+                return;
+            }
+
+            int count_active = 0;
+            int64_t weight_active = 0;
+            for (const auto & m : mapping) {
+                if (m.second.meta.is_active()) {
+                    count_active++;
+                    weight_active += m.second.meta.weight;
+                    if (m.first != model_name && m.second.meta.last_used < lru_last_used) {
+                        lru_model_name = m.first;
+                        lru_last_used = m.second.meta.last_used;
+                    }
+                }
+            }
+
+            const bool fits_count = base_params.models_max <= 0 || (count_active + 1) <= base_params.models_max;
+            const bool fits_weight = base_params.models_max_weight <= 0 || (weight_active + target.weight) <= base_params.models_max_weight;
+            if (fits_count && fits_weight) {
+                return;
+            }
         }
+
+        if (lru_model_name.empty()) {
+            throw std::runtime_error(string_format(
+                "cannot load model '%s': insufficient capacity (models_max=%d, models_max_weight=%d)",
+                model_name.c_str(),
+                base_params.models_max,
+                base_params.models_max_weight
+            ));
+        }
+
+        SRV_INF("router capacity limit reached, removing LRU name=%s\n", lru_model_name.c_str());
+        unload(lru_model_name);
+
+        // wait for unload to complete
+        std::unique_lock<std::mutex> lk(mutex);
+        cv.wait(lk, [this, &lru_model_name]() {
+            return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
+        });
     }
 }
 
@@ -449,7 +519,19 @@ void server_models::load(const std::string & name) {
     if (!has_model(name)) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
-    unload_lru();
+    auto target = get_meta(name);
+    if (!target.has_value()) {
+        throw std::runtime_error("model name=" + name + " is not found");
+    }
+    if (base_params.models_max_weight > 0 && target->weight > base_params.models_max_weight) {
+        throw std::runtime_error(string_format(
+            "cannot load model '%s': model-weight (%d) exceeds models_max_weight (%d)",
+            name.c_str(),
+            target->weight,
+            base_params.models_max_weight
+        ));
+    }
+    unload_lru_until_fit(name);
 
     std::lock_guard<std::mutex> lk(mutex);
 

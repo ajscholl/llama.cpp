@@ -209,6 +209,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
 | `--models-max N` | for router server, maximum number of models to load simultaneously (default: 4, 0 = unlimited)<br/>(env: LLAMA_ARG_MODELS_MAX) |
+| `--models-max-weight N` | for router server, maximum combined model weight to load simultaneously (default: 0, 0 = unlimited)<br/>(env: LLAMA_ARG_MODELS_MAX_WEIGHT) |
 | `--models-autoload, --no-models-autoload` | for router server, whether to automatically load models (default: enabled)<br/>(env: LLAMA_ARG_MODELS_AUTOLOAD) |
 | `--jinja, --no-jinja` | whether to use jinja template engine for chat (default: enabled)<br/>(env: LLAMA_ARG_JINJA) |
 | `--reasoning-format FORMAT` | controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:<br/>- none: leaves thoughts unparsed in `message.content`<br/>- deepseek: puts thoughts in `message.reasoning_content`<br/>- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`<br/>(default: auto)<br/>(env: LLAMA_ARG_THINK) |
@@ -1591,6 +1592,11 @@ The precedence rule for preset options is as follows:
 We also offer additional options that are exclusive to presets (these aren't treated as command-line arguments):
 - `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts
 - `stop-timeout` (int, seconds): After requested unload, wait for this many seconds before forcing termination (default: 10)
+- `model-weight` (int): Per-model weight used by `--models-max-weight` eviction budget (default: 1)
+
+When router capacity is exceeded, models are evicted using LRU policy until both active limits are satisfied:
+- `--models-max` (instance count)
+- `--models-max-weight` (combined model weight)
 
 ### Routing requests
 
