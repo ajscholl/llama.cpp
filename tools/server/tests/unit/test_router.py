@@ -1,4 +1,5 @@
 import pytest
+from pathlib import Path
 from utils import *
 
 server: ServerProcess
@@ -123,6 +124,69 @@ def test_router_models_max_evicts_lru():
     # Verify eviction: third is loaded, first was evicted
     assert _get_model_status(third) == "loaded"
     assert _get_model_status(first) == "unloaded"
+
+
+def _write_router_weight_preset(path: Path) -> None:
+    path.write_text(
+        """version = 1
+
+[*]
+models-max-weight = 4
+
+[ggml-org/tinygemma3-GGUF:Q8_0]
+model-weight = 2
+
+[ggml-org/test-model-stories260K]
+model-weight = 2
+
+[ggml-org/test-model-stories260K-infill]
+model-weight = 3
+""",
+        encoding="utf-8",
+    )
+
+
+def test_router_models_max_weight_evicts_lru(tmp_path: Path):
+    global server
+    preset_path = tmp_path / "router-weights.ini"
+    _write_router_weight_preset(preset_path)
+
+    server.models_preset = str(preset_path)
+    server.models_max = 0
+    server.start()
+
+    first = "ggml-org/tinygemma3-GGUF:Q8_0"
+    second = "ggml-org/test-model-stories260K"
+    third = "ggml-org/test-model-stories260K-infill"
+
+    _load_model_and_wait(first, timeout=120)
+    _load_model_and_wait(second, timeout=120)
+    assert _get_model_status(first) == "loaded"
+    assert _get_model_status(second) == "loaded"
+
+    _load_model_and_wait(third, timeout=120)
+    assert _get_model_status(third) == "loaded"
+    assert _get_model_status(first) == "unloaded"
+    assert _get_model_status(second) == "unloaded"
+
+
+def test_router_models_max_weight_rejects_oversized_model(tmp_path: Path):
+    global server
+    preset_path = tmp_path / "router-weights.ini"
+    _write_router_weight_preset(preset_path)
+
+    preset_path.write_text(
+        preset_path.read_text(encoding="utf-8") + "\n[oversized]\nmodel = ./tmp/tinyllamas/stories260K.gguf\nmodel-weight = 10\n",
+        encoding="utf-8",
+    )
+
+    server.models_preset = str(preset_path)
+    server.models_max = 0
+    server.start()
+
+    res = server.make_request("POST", "/models/load", data={"model": "oversized"})
+    assert res.status_code == 500
+    assert "error" in res.body
 
 
 def test_router_no_models_autoload():

@@ -3032,6 +3032,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MAX"));
     add_opt(common_arg(
+        {"--models-max-weight"}, "N",
+        string_format("for router server, maximum combined model weight to load simultaneously (default: %d, 0 = unlimited)", params.models_max_weight),
+        [](common_params & params, int value) {
+            params.models_max_weight = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MAX_WEIGHT"));
+    add_opt(common_arg(
         {"--models-autoload"},
         {"--no-models-autoload"},
         string_format("for router server, whether to automatically load models (default: %s)", params.models_autoload ? "enabled" : "disabled"),
@@ -3864,6 +3871,12 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "in server router mode, force-kill model instance after this many seconds of graceful shutdown",
         [](common_params &, int) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_STOP_TIMEOUT).set_preset_only());
+
+    args.push_back(common_arg(
+        {"model-weight"}, "N",
+        "in server router mode, model weight used by models-max-weight eviction budget (default: 1)",
+        [](common_params &, int) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_MODEL_WEIGHT).set_preset_only());
 
     // args.push_back(common_arg(
     //     {"pin"},
