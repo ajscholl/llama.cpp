@@ -67,6 +67,7 @@ struct server_model_meta {
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
     mtmd_caps multimodal; // multimodal capabilities
+    int weight = 1; // model weight used for weighted eviction budget
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -115,8 +116,8 @@ private:
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
-    // unload least recently used models if the limit is reached
-    void unload_lru();
+    // unload least recently used models until limits can fit this model
+    void unload_lru_until_fit(const std::string & model_name);
 
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);

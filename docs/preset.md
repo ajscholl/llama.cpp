@@ -95,3 +95,8 @@ llama-server -hf user/repo:gpt-oss-120b-hf
 ```
 
 Please make sure to provide the correct `hf-repo` for each child preset. Otherwise, you may get error: `The specified tag is not a valid quantization scheme.`
+
+For router mode (`llama-server` without `--model`), presets also support router-specific keys:
+
+- `model-weight` (preset-only, per model): weight used by weighted router eviction (default: `1`)
+- `models-max-weight` (regular server arg, can be set in `[*]` or CLI): max combined loaded model weight (`0` = unlimited)
