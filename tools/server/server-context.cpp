@@ -4198,9 +4198,12 @@ void server_routes::init_routes() {
         }
 
         int top_n = json_value(body, "top_n", (int)documents.size());
+        bool stream = json_value(body, "stream", false);
+        bool return_progress = json_value(body, "return_progress", false);
 
         // create and queue the task
         json responses = json::array();
+        int64_t total_tokens = 0;
         auto & rd = res->rd;
         {
             std::vector<server_task> tasks;
@@ -4210,37 +4213,217 @@ void server_routes::init_routes() {
                 server_task task = server_task(SERVER_TASK_TYPE_RERANK);
                 task.id     = rd.get_new_id();
                 task.tokens = std::move(tmp);
+                total_tokens += task.n_tokens();
                 tasks.push_back(std::move(task));
             }
             rd.post_tasks(std::move(tasks));
         }
 
-        // wait for the results
-        auto all_results = rd.wait_for_all(req.should_stop);
+        if (!stream) {
+            // wait for the results
+            auto all_results = rd.wait_for_all(req.should_stop);
 
-        // collect results
-        if (all_results.is_terminated) {
-            return res; // connection is closed
-        } else if (all_results.error) {
-            res->error(all_results.error->to_json());
-            return res;
-        } else {
-            for (auto & res : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr);
-                responses.push_back(res->to_json());
+            // collect results
+            if (all_results.is_terminated) {
+                return res; // connection is closed
+            } else if (all_results.error) {
+                res->error(all_results.error->to_json());
+                return res;
+            } else {
+                for (auto & res : all_results.results) {
+                    GGML_ASSERT(dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr);
+                    responses.push_back(res->to_json());
+                }
             }
+
+            // write JSON response
+            json root = format_response_rerank(
+                body,
+                meta->model_name,
+                responses,
+                is_tei_format,
+                documents,
+                top_n);
+
+            res->ok(root);
+            return res;
         }
 
-        // write JSON response
-        json root = format_response_rerank(
+        // in streaming mode, the first error must be treated as non-stream response
+        auto first_result = rd.next(req.should_stop);
+        if (first_result == nullptr) {
+            GGML_ASSERT(req.should_stop());
+            return res; // connection is closed
+        }
+
+        if (first_result->is_error()) {
+            res->error(first_result->to_json());
+            return res;
+        }
+
+        auto * first_rerank = dynamic_cast<server_task_result_rerank *>(first_result.get());
+        GGML_ASSERT(first_rerank != nullptr);
+
+        const int64_t t_start_us = ggml_time_us();
+
+        json first_rerank_json = first_result->to_json();
+        responses.push_back(first_rerank_json);
+
+        int32_t processed_documents = 1;
+        int64_t processed_tokens = json_value(first_rerank_json, "tokens_evaluated", 0);
+
+        json first_chunks = json::array();
+        first_chunks.push_back(json{
+            {"object", "rerank.item"},
+            {"index", json_value(first_rerank_json, "index", 0)},
+            {"score", json_value(first_rerank_json, "score", 0.0)},
+            {"tokens_evaluated", json_value(first_rerank_json, "tokens_evaluated", 0)},
+        });
+
+        if (return_progress) {
+            first_chunks.push_back(json{
+                {"object", "rerank.progress"},
+                {"progress", {
+                    {"total_documents", (int) documents.size()},
+                    {"processed_documents", processed_documents},
+                    {"total_tokens", total_tokens},
+                    {"processed_tokens", processed_tokens},
+                    {"time_ms", (ggml_time_us() - t_start_us) / 1000},
+                }},
+            });
+        }
+
+        struct rerank_stream_state {
+            json body;
+            std::string model_name;
+            std::vector<std::string> documents;
+            json responses;
+            bool is_tei_format;
+            bool return_progress;
+            int top_n;
+            int total_documents;
+            int32_t processed_documents;
+            int64_t total_tokens;
+            int64_t processed_tokens;
+            int64_t t_start_us;
+        };
+
+        const int total_documents = (int) documents.size();
+
+        auto state = std::make_shared<rerank_stream_state>(rerank_stream_state{
             body,
             meta->model_name,
-            responses,
+            std::move(documents),
+            std::move(responses),
             is_tei_format,
-            documents,
-            top_n);
+            return_progress,
+            top_n,
+            total_documents,
+            processed_documents,
+            total_tokens,
+            processed_tokens,
+            t_start_us,
+        });
 
-        res->ok(root);
+        res->data = format_oai_sse(first_chunks);
+        res->status = 200;
+        res->content_type = "text/event-stream";
+        res->next = [res_this = res.get(), state, &req](std::string & output) -> bool {
+            try {
+                if (req.should_stop()) {
+                    SRV_DBG("%s", "stopping rerank streaming due to should_stop condition\n");
+                    return false;
+                }
+
+                if (!res_this->data.empty()) {
+                    output = std::move(res_this->data);
+                    res_this->data.clear();
+                    return true;
+                }
+
+                server_response_reader & rd = res_this->rd;
+
+                if (!rd.has_next()) {
+                    json root = format_response_rerank(
+                        state->body,
+                        state->model_name,
+                        state->responses,
+                        state->is_tei_format,
+                        state->documents,
+                        state->top_n);
+
+                    json final_results = root.is_array()
+                        ? root
+                        : json_value(root, "results", json::array());
+
+                    json done = {
+                        {"object", "rerank.done"},
+                        {"model", json_value(state->body, "model", state->model_name)},
+                        {"results", final_results},
+                        {"usage", {
+                            {"prompt_tokens", state->processed_tokens},
+                            {"total_tokens", state->processed_tokens},
+                        }},
+                    };
+
+                    output = format_oai_sse(done) + "data: [DONE]\n\n";
+                    SRV_DBG("%s", "all rerank results received, terminating stream\n");
+                    return false;
+                }
+
+                auto result = rd.next(req.should_stop);
+                if (result == nullptr) {
+                    SRV_DBG("%s", "stopping rerank streaming due to should_stop condition\n");
+                    GGML_ASSERT(req.should_stop());
+                    return false;
+                }
+
+                if (result->is_error()) {
+                    output = format_oai_sse(json{{"error", result->to_json()}});
+                    SRV_DBG("%s", "error received during rerank streaming, terminating stream\n");
+                    return false;
+                }
+
+                auto * rerank_res = dynamic_cast<server_task_result_rerank *>(result.get());
+                GGML_ASSERT(rerank_res != nullptr);
+
+                json rerank_json = result->to_json();
+                state->responses.push_back(rerank_json);
+
+                state->processed_documents += 1;
+                state->processed_tokens += json_value(rerank_json, "tokens_evaluated", 0);
+
+                json chunks = json::array();
+                chunks.push_back(json{
+                    {"object", "rerank.item"},
+                    {"index", json_value(rerank_json, "index", 0)},
+                    {"score", json_value(rerank_json, "score", 0.0)},
+                    {"tokens_evaluated", json_value(rerank_json, "tokens_evaluated", 0)},
+                });
+
+                if (state->return_progress) {
+                    chunks.push_back(json{
+                        {"object", "rerank.progress"},
+                        {"progress", {
+                            {"total_documents", state->total_documents},
+                            {"processed_documents", state->processed_documents},
+                            {"total_tokens", state->total_tokens},
+                            {"processed_tokens", state->processed_tokens},
+                            {"time_ms", (ggml_time_us() - state->t_start_us) / 1000},
+                        }},
+                    });
+                }
+
+                output = format_oai_sse(chunks);
+                return true;
+
+            } catch (const std::exception & e) {
+                json error_json = format_error_response(e.what(), ERROR_TYPE_SERVER);
+                output = format_oai_sse(json{{"error", error_json}});
+                return false;
+            }
+        };
+
         return res;
     };
 
