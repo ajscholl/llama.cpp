@@ -656,6 +656,10 @@ Requires a reranker model (such as [bge-reranker-v2-m3](https://huggingface.co/B
 
 `documents`: An array strings representing the documents to be ranked.
 
+`stream`: If `true`, return results as `text/event-stream` (`false` by default).
+
+`return_progress`: If `true` and `stream=true`, include progress updates (`false` by default).
+
 *Aliases:*
   - `/rerank`
   - `/v1/rerank`
@@ -676,6 +680,37 @@ curl http://127.0.0.1:8012/v1/rerank \
             "The giant panda (Ailuropoda melanoleuca), sometimes called a panda bear or simply panda, is a bear species endemic to China."
             ]
     }' | jq
+```
+
+Streaming example:
+
+```shell
+curl -N http://127.0.0.1:8012/v1/rerank \
+    -H "Content-Type: application/json" \
+    -d '{
+        "query": "What is panda?",
+        "top_n": 2,
+        "stream": true,
+        "return_progress": true,
+        "documents": [
+            "hi",
+            "it is a bear",
+            "The giant panda (Ailuropoda melanoleuca) is a bear species endemic to China."
+        ]
+    }'
+```
+
+Example stream chunks:
+
+```text
+data: {"object":"rerank.item","index":2,"score":0.8421,"tokens_evaluated":121}
+
+data: {"object":"rerank.progress","progress":{"total_documents":3,"processed_documents":1,"total_tokens":184,"processed_tokens":121,"time_ms":37}}
+
+data: {"object":"rerank.done","model":"your-model","results":[{"index":2,"relevance_score":0.8421},{"index":1,"relevance_score":0.3244}],"usage":{"prompt_tokens":184,"total_tokens":184}}
+
+data: [DONE]
+
 ```
 
 ### POST `/infill`: For code infilling.
