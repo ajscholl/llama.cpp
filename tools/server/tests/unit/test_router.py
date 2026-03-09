@@ -59,6 +59,15 @@ def _get_model_status(model_id: str) -> str:
     raise AssertionError(f"Model {model_id} not found in /models response")
 
 
+def _get_model_info(model_id: str) -> dict:
+    res = server.make_request("GET", "/models")
+    assert res.status_code == 200
+    for item in res.body.get("data", []):
+        if item.get("id") == model_id or item.get("model") == model_id:
+            return item
+    raise AssertionError(f"Model {model_id} not found in /models response")
+
+
 def _wait_for_model_status(model_id: str, desired: set[str], timeout: int = 60) -> str:
     deadline = time.time() + timeout
     last_status = None
@@ -276,3 +285,46 @@ def test_router_chunk_endpoint():
     for big in res.body["chunks"]:
         small_chunks.extend(big["small_chunks"])
     assert "".join(chunk["text"] for chunk in small_chunks) == document
+
+
+def test_router_recovers_from_crashed_child():
+    global server
+    server.start()
+
+    model_id = "ggml-org/tinygemma3-GGUF:Q8_0"
+    _load_model_and_wait(model_id, timeout=120)
+
+    killed_pid = server.kill_latest_descendant()
+    assert killed_pid > 0
+
+    _wait_for_model_status(model_id, {"unloaded"}, timeout=30)
+
+    res = server.make_request(
+        "POST",
+        "/v1/chat/completions",
+        data={
+            "model": model_id,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+        },
+    )
+    assert res.status_code == 200
+    assert "error" not in res.body
+    _wait_for_model_status(model_id, {"loaded"}, timeout=120)
+
+
+def test_router_reports_crashed_child_exit_code():
+    global server
+    server.start()
+
+    model_id = "ggml-org/tinygemma3-GGUF:Q8_0"
+    _load_model_and_wait(model_id, timeout=120)
+
+    server.kill_latest_descendant()
+    _wait_for_model_status(model_id, {"unloaded"}, timeout=30)
+
+    info = _get_model_info(model_id)
+    status = info["status"]
+    assert status["value"] == "unloaded"
+    assert status["failed"] is True
+    assert status["exit_code"] != 0

@@ -7,6 +7,7 @@ import subprocess
 import os
 import re
 import json
+import signal
 from json import JSONDecodeError
 import sys
 import requests
@@ -296,6 +297,40 @@ class ServerProcess:
             print(f"Stopping server with pid={self.process.pid}")
             self.process.kill()
             self.process = None
+
+    def _child_pids(self, parent_pid: int) -> List[int]:
+        if os.name == "nt":
+            raise NotImplementedError("process tree inspection is not implemented on Windows")
+
+        result = subprocess.run(
+            ["ps", "-o", "pid=", "--ppid", str(parent_pid)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return [int(line.strip()) for line in result.stdout.splitlines() if line.strip()]
+
+    def descendant_pids(self) -> List[int]:
+        if self.process is None:
+            return []
+
+        pending = [self.process.pid]
+        descendants: List[int] = []
+        while pending:
+            parent_pid = pending.pop()
+            child_pids = self._child_pids(parent_pid)
+            descendants.extend(child_pids)
+            pending.extend(child_pids)
+        return descendants
+
+    def kill_latest_descendant(self) -> int:
+        descendants = self.descendant_pids()
+        if not descendants:
+            raise RuntimeError("No child processes found")
+
+        pid = max(descendants)
+        os.kill(pid, signal.SIGKILL)
+        return pid
 
     def make_request(
         self,
