@@ -884,7 +884,8 @@ void server_models::load(const std::string & name) {
 
     // start a thread to manage the child process
     // captured variables are guaranteed to be destroyed only after the thread is joined
-    inst.th = std::thread([this, name, child_proc = inst.subproc, port = inst.meta.port, stop_timeout = inst.meta.stop_timeout]() {
+    auto child_finished = std::make_shared<std::atomic<bool>>(false);
+    inst.th = std::thread([this, name, child_proc = inst.subproc, port = inst.meta.port, stop_timeout = inst.meta.stop_timeout, child_finished]() {
         FILE * stdin_file = subprocess_stdin(child_proc.get());
         FILE * stdout_file = subprocess_stdout(child_proc.get()); // combined stdout/stderr
 
@@ -916,14 +917,13 @@ void server_models::load(const std::string & name) {
                 return this->stopping_models.find(name) != this->stopping_models.end();
             };
             auto should_wake = [&]() {
-                return is_stopping() || !subprocess_alive(child_proc.get());
+                return is_stopping() || child_finished->load() || !subprocess_alive(child_proc.get());
             };
             {
                 std::unique_lock<std::mutex> lk(this->mutex);
                 this->cv_stop.wait(lk, should_wake);
             }
-            // child may have already exited (e.g. crashed) — skip shutdown sequence
-            if (!subprocess_alive(child_proc.get())) {
+            if (!is_stopping() && (child_finished->load() || !subprocess_alive(child_proc.get()))) {
                 return;
             }
             SRV_INF("stopping model instance name=%s\n", name.c_str());
@@ -953,6 +953,9 @@ void server_models::load(const std::string & name) {
         if (log_thread.joinable()) {
             log_thread.join();
         }
+
+        child_finished->store(true);
+        cv_stop.notify_all();
 
         // stop the timeout monitoring thread
         {
