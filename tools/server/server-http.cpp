@@ -395,6 +395,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
             req.path,
             build_query_string(req),
             req.body,
+            req.remote_addr,
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
@@ -410,10 +411,10 @@ void server_http_context::post(const std::string & path, const server_http_conte
             req.path,
             build_query_string(req),
             req.body,
+            req.remote_addr,
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     });
 }
-

@@ -8,6 +8,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <fstream>
 #include <memory>
 #include <set>
 
@@ -74,6 +75,25 @@ struct server_model_meta {
 };
 
 struct subprocess_s;
+struct router_log_context;
+
+struct router_jsonl_logger {
+    std::mutex mutex;
+    std::ofstream file;
+
+    explicit router_jsonl_logger(const std::string & path);
+    void log_request(const router_log_context & ctx);
+    void log_response(const router_log_context & ctx, int status, const std::string & body, const std::string & content_type, bool complete, const std::string & error_message);
+};
+
+struct router_log_context {
+    std::string request_id;
+    std::string route;
+    std::string query_string;
+    std::string client_ip;
+    std::string model;
+    json input;
+};
 
 struct server_models {
 private:
@@ -139,7 +159,13 @@ public:
     bool ensure_model_loaded(const std::string & name);
 
     // proxy an HTTP request to the model instance
-    server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used);
+    server_http_res_ptr proxy_request(
+        const server_http_req & req,
+        const std::string & method,
+        const std::string & name,
+        bool update_last_used,
+        std::shared_ptr<router_jsonl_logger> router_logger = nullptr,
+        std::shared_ptr<router_log_context> log_ctx = nullptr);
 
     // notify the router server that a model instance is ready
     // return the monitoring thread (to be joined by the caller)
@@ -149,9 +175,13 @@ public:
 struct server_models_routes {
     common_params params;
     json webui_settings = json::object();
+    std::shared_ptr<router_jsonl_logger> router_logger;
     server_models models;
     server_models_routes(const common_params & params, int argc, char ** argv)
             : params(params), models(params, argc, argv) {
+        if (!this->params.router_log_jsonl_file.empty()) {
+            router_logger = std::shared_ptr<router_jsonl_logger>(new router_jsonl_logger(this->params.router_log_jsonl_file));
+        }
         if (!this->params.webui_config_json.empty()) {
             try {
                 webui_settings = json::parse(this->params.webui_config_json);
@@ -189,7 +219,9 @@ public:
                       const std::string & body,
                       const std::function<bool()> should_stop,
                       int32_t timeout_read,
-                      int32_t timeout_write
+                      int32_t timeout_write,
+                      std::shared_ptr<router_jsonl_logger> router_logger = nullptr,
+                      std::shared_ptr<router_log_context> log_ctx = nullptr
                       );
     ~server_http_proxy() {
         if (cleanup) {

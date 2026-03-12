@@ -3047,6 +3047,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_AUTOLOAD"));
     add_opt(common_arg(
+        {"--router-log-jsonl-file"}, "PATH",
+        "for router server, append generation request/response logs as JSONL to this file (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.router_log_jsonl_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ROUTER_LOG_JSONL_FILE"));
+    add_opt(common_arg(
         {"--jinja"},
         {"--no-jinja"},
         string_format("whether to use jinja template engine for chat (default: %s)", params.use_jinja ? "enabled" : "disabled"),

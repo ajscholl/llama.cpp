@@ -18,6 +18,7 @@
 #include <queue>
 #include <filesystem>
 #include <cstring>
+#include <unordered_set>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -44,6 +45,94 @@ extern char **environ;
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
 #define CHILD_ADDR "127.0.0.1"
+
+static int64_t router_log_timestamp_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static bool router_should_log_path(const std::string & path) {
+    static const std::unordered_set<std::string> paths = {
+        "/completion",
+        "/completions",
+        "/v1/completions",
+        "/chat/completions",
+        "/v1/chat/completions",
+        "/api/chat",
+        "/v1/responses",
+        "/responses",
+        "/v1/messages",
+        "/infill",
+        "/embedding",
+        "/embeddings",
+        "/v1/embeddings",
+        "/rerank",
+        "/reranking",
+        "/v1/rerank",
+        "/v1/reranking",
+        "/v1/chunk",
+    };
+
+    return paths.find(path) != paths.end();
+}
+
+static json router_parse_log_body(const std::string & body) {
+    if (body.empty()) {
+        return json(nullptr);
+    }
+
+    try {
+        return json::parse(body);
+    } catch (...) {
+        return body;
+    }
+}
+
+router_jsonl_logger::router_jsonl_logger(const std::string & path) {
+    file.open(path, std::ios::out | std::ios::app);
+    if (!file.is_open()) {
+        throw std::runtime_error("failed to open router JSONL log file: " + path);
+    }
+}
+
+void router_jsonl_logger::log_request(const router_log_context & ctx) {
+    std::lock_guard<std::mutex> lock(mutex);
+    file << safe_json_to_str(json{
+        {"timestamp_ms", router_log_timestamp_ms()},
+        {"event", "request"},
+        {"request_id", ctx.request_id},
+        {"route", ctx.route},
+        {"query_string", ctx.query_string},
+        {"client_ip", ctx.client_ip},
+        {"model", ctx.model},
+        {"input", ctx.input},
+    }) << '\n';
+    file.flush();
+}
+
+void router_jsonl_logger::log_response(const router_log_context & ctx, int status, const std::string & body, const std::string & content_type, bool complete, const std::string & error_message) {
+    std::lock_guard<std::mutex> lock(mutex);
+    json line = {
+        {"timestamp_ms", router_log_timestamp_ms()},
+        {"event", "response"},
+        {"request_id", ctx.request_id},
+        {"route", ctx.route},
+        {"query_string", ctx.query_string},
+        {"client_ip", ctx.client_ip},
+        {"model", ctx.model},
+        {"status", status},
+        {"content_type", content_type},
+        {"complete", complete},
+        {"output", router_parse_log_body(body)},
+    };
+
+    if (!error_message.empty()) {
+        line["error"] = error_message;
+    }
+
+    file << safe_json_to_str(line) << '\n';
+    file.flush();
+}
 
 static std::filesystem::path get_server_exec_path() {
 #if defined(_WIN32)
@@ -855,7 +944,13 @@ bool server_models::ensure_model_loaded(const std::string & name) {
     return true;
 }
 
-server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used) {
+server_http_res_ptr server_models::proxy_request(
+        const server_http_req & req,
+        const std::string & method,
+        const std::string & name,
+        bool update_last_used,
+        std::shared_ptr<router_jsonl_logger> router_logger,
+        std::shared_ptr<router_log_context> log_ctx) {
     auto meta = get_meta(name);
     if (!meta.has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
@@ -882,7 +977,9 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             req.body,
             req.should_stop,
             base_params.timeout_read,
-            base_params.timeout_write
+            base_params.timeout_write,
+            std::move(router_logger),
+            std::move(log_ctx)
             );
     return proxy;
 }
@@ -1009,10 +1106,31 @@ void server_models_routes::init_routes() {
         std::string name = json_value(body, "model", std::string());
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
+        std::shared_ptr<router_log_context> log_ctx;
+
+        if (router_logger != nullptr && router_should_log_path(req.path)) {
+            log_ctx = std::make_shared<router_log_context>(router_log_context{
+                /* request_id   */ random_string(),
+                /* route        */ req.path,
+                /* query_string */ req.query_string,
+                /* client_ip    */ req.remote_addr,
+                /* model        */ name,
+                /* input        */ body,
+            });
+            router_logger->log_request(*log_ctx);
+        }
+
         if (!router_validate_model(name, models, autoload, error_res)) {
+            if (router_logger != nullptr && log_ctx != nullptr) {
+                log_ctx->model = name;
+                router_logger->log_response(*log_ctx, error_res->status, error_res->data, error_res->content_type, true, "router_validation_failed");
+            }
             return error_res;
         }
-        return models.proxy_request(req, method, name, true); // update last usage for POST request only
+        if (log_ctx != nullptr) {
+            log_ctx->model = name;
+        }
+        return models.proxy_request(req, method, name, true, router_logger, std::move(log_ctx)); // update last usage for POST request only
     };
 
     this->post_router_models_load = [this](const server_http_req & req) {
@@ -1179,11 +1297,20 @@ server_http_proxy::server_http_proxy(
         const std::string & body,
         const std::function<bool()> should_stop,
         int32_t timeout_read,
-        int32_t timeout_write
+        int32_t timeout_write,
+        std::shared_ptr<router_jsonl_logger> router_logger,
+        std::shared_ptr<router_log_context> log_ctx
         ) {
+    struct proxy_log_state {
+        int status = 500;
+        std::string body;
+        std::string content_type;
+    };
+
     // shared between reader and writer threads
     auto cli  = std::make_shared<httplib::ClientImpl>(host, port);
     auto pipe = std::make_shared<pipe_t<msg_t>>();
+    auto log_state = std::make_shared<proxy_log_state>();
 
     if (scheme == "https") {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -1216,9 +1343,10 @@ server_http_proxy::server_http_proxy(
 
     // wire up the HTTP client
     // note: do NOT capture `this` pointer, as it may be destroyed before the thread ends
-    httplib::ResponseHandler response_handler = [pipe, cli](const httplib::Response & response) {
+    httplib::ResponseHandler response_handler = [pipe, cli, log_state](const httplib::Response & response) {
         msg_t msg;
         msg.status = response.status;
+        log_state->status = response.status;
         for (const auto & [key, value] : response.headers) {
             const auto lowered = to_lower_copy(key);
             if (should_strip_proxy_header(lowered)) {
@@ -1226,13 +1354,15 @@ server_http_proxy::server_http_proxy(
             }
             if (lowered == "content-type") {
                 msg.content_type = value;
+                log_state->content_type = value;
                 continue;
             }
             msg.headers[key] = value;
         }
         return pipe->write(std::move(msg)); // send headers first
     };
-    httplib::ContentReceiverWithProgress content_receiver = [pipe](const char * data, size_t data_length, size_t, size_t) {
+    httplib::ContentReceiverWithProgress content_receiver = [pipe, log_state](const char * data, size_t data_length, size_t, size_t) {
+        log_state->body.append(data, data_length);
         // send data chunks
         // returns false if pipe is closed / broken (signal to stop receiving)
         return pipe->write({{}, 0, std::string(data, data_length), ""});
@@ -1261,13 +1391,20 @@ server_http_proxy::server_http_proxy(
 
     // start the proxy thread
     SRV_DBG("start proxy thread %s %s\n", req.method.c_str(), req.path.c_str());
-    this->thread = std::thread([cli, pipe, req]() {
+    this->thread = std::thread([cli, pipe, req, log_state, router_logger, log_ctx]() {
         auto result = cli->send(std::move(req));
         if (result.error() != httplib::Error::Success) {
             auto err_str = httplib::to_string(result.error());
             SRV_ERR("http client error: %s\n", err_str.c_str());
             pipe->write({{}, 500, "", ""}); // header
             pipe->write({{}, 0, "proxy error: " + err_str, ""}); // body
+            log_state->status = 500;
+            log_state->body += "proxy error: " + err_str;
+            if (router_logger != nullptr && log_ctx != nullptr) {
+                router_logger->log_response(*log_ctx, log_state->status, log_state->body, log_state->content_type, false, err_str);
+            }
+        } else if (router_logger != nullptr && log_ctx != nullptr) {
+            router_logger->log_response(*log_ctx, log_state->status, log_state->body, log_state->content_type, !pipe->reader_closed.load(), "");
         }
         pipe->close_write(); // signal EOF to reader
         SRV_DBG("%s", "client request thread ended\n");

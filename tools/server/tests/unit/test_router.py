@@ -93,6 +93,17 @@ def _load_model_and_wait(
     _wait_for_model_status(model_id, {"loaded"}, timeout=timeout)
 
 
+def _read_router_log_lines(path: Path, expected_lines: int, timeout: int = 20) -> list[dict]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if path.exists():
+            lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if len(lines) >= expected_lines:
+                return [json.loads(line) for line in lines]
+        time.sleep(0.1)
+    raise AssertionError(f"Timed out waiting for {expected_lines} router log lines in {path}")
+
+
 def test_router_unload_model():
     global server
     server.start()
@@ -285,6 +296,101 @@ def test_router_chunk_endpoint():
     for big in res.body["chunks"]:
         small_chunks.extend(big["small_chunks"])
     assert "".join(chunk["text"] for chunk in small_chunks) == document
+
+
+def test_router_logs_non_stream_chat_completion(tmp_path: Path):
+    global server
+    log_path = tmp_path / "router.jsonl"
+    server.router_log_jsonl_file = str(log_path)
+    server.start()
+
+    model_id = "ggml-org/tinygemma3-GGUF:Q8_0"
+    res = server.make_request(
+        "POST",
+        "/v1/chat/completions",
+        data={
+            "model": model_id,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+        },
+    )
+
+    assert res.status_code == 200
+
+    lines = _read_router_log_lines(log_path, 2)
+    request_line, response_line = lines[-2], lines[-1]
+
+    assert request_line["event"] == "request"
+    assert request_line["route"] == "/v1/chat/completions"
+    assert request_line["client_ip"] == server.server_host
+    assert request_line["input"]["model"] == model_id
+
+    assert response_line["event"] == "response"
+    assert response_line["request_id"] == request_line["request_id"]
+    assert response_line["status"] == 200
+    assert response_line["complete"] is True
+    assert response_line["output"]["model"] == model_id
+    assert response_line["output"]["choices"][0]["message"]["content"]
+
+
+def test_router_logs_stream_chat_completion(tmp_path: Path):
+    global server
+    log_path = tmp_path / "router-stream.jsonl"
+    server.router_log_jsonl_file = str(log_path)
+    server.start()
+
+    model_id = "ggml-org/tinygemma3-GGUF:Q8_0"
+    chunks = list(server.make_stream_request(
+        "POST",
+        "/chat/completions",
+        data={
+            "model": model_id,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 8,
+            "stream": True,
+        },
+    ))
+
+    assert len(chunks) > 0
+
+    lines = _read_router_log_lines(log_path, 2)
+    request_line, response_line = lines[-2], lines[-1]
+
+    assert request_line["event"] == "request"
+    assert request_line["route"] == "/chat/completions"
+
+    assert response_line["event"] == "response"
+    assert response_line["request_id"] == request_line["request_id"]
+    assert response_line["status"] == 200
+    assert response_line["complete"] is True
+    assert response_line["content_type"] == "text/event-stream"
+    assert isinstance(response_line["output"], str)
+    assert "data: [DONE]" in response_line["output"]
+
+
+def test_router_logs_chunk_endpoint(tmp_path: Path):
+    global server
+    log_path = tmp_path / "router-chunk.jsonl"
+    server.router_log_jsonl_file = str(log_path)
+    server.start()
+
+    model_id = "ggml-org/tinygemma3-GGUF:Q8_0"
+    document = "Section A. First sentence. Second sentence.\nSection B. Third sentence."
+
+    res = server.make_request("POST", "/v1/chunk", data={
+        "model": model_id,
+        "document": document,
+    })
+
+    assert res.status_code == 200
+
+    lines = _read_router_log_lines(log_path, 2)
+    request_line, response_line = lines[-2], lines[-1]
+
+    assert request_line["route"] == "/v1/chunk"
+    assert request_line["input"]["document"] == document
+    assert response_line["request_id"] == request_line["request_id"]
+    assert response_line["output"]["chunks"]
 
 
 def test_router_recovers_from_crashed_child():

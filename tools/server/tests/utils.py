@@ -91,6 +91,7 @@ class ServerProcess:
     models_max: int | None = None
     models_max_weight: int | None = None
     no_models_autoload: bool | None = None
+    router_log_jsonl_file: str | None = None
     lora_files: List[str] | None = None
     enable_ctx_shift: int | None = False
     draft_min: int | None = None
@@ -226,6 +227,8 @@ class ServerProcess:
             server_args.append("--no-webui")
         if self.no_models_autoload:
             server_args.append("--no-models-autoload")
+        if self.router_log_jsonl_file:
+            server_args.extend(["--router-log-jsonl-file", self.router_log_jsonl_file])
         if self.jinja:
             server_args.append("--jinja")
         else:

@@ -574,6 +574,7 @@ struct common_params {
     int models_max = 4;             // maximum number of models to load simultaneously
     int models_max_weight = 0;      // maximum combined model weight to load simultaneously (0 = unlimited)
     bool models_autoload = true;    // automatically load models when requested via the router server
+    std::string router_log_jsonl_file = ""; // router JSONL request/response log file
 
     bool log_json = false;
 
