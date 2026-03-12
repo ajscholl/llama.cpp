@@ -48,8 +48,28 @@ struct server_http_req {
     std::string path;
     std::string query_string; // query parameters string (e.g. "action=save")
     std::string body;
+    std::string remote_addr;
     std::map<std::string, uploaded_file> files; // used for file uploads (form data)
     const std::function<bool()> & should_stop;
+
+    server_http_req(
+        std::map<std::string, std::string> params,
+        std::map<std::string, std::string> headers,
+        std::string path,
+        std::string query_string,
+        std::string body,
+        std::string remote_addr,
+        std::map<std::string, uploaded_file> files,
+        const std::function<bool()> & should_stop)
+        : params(std::move(params))
+        , headers(std::move(headers))
+        , path(std::move(path))
+        , query_string(std::move(query_string))
+        , body(std::move(body))
+        , remote_addr(std::move(remote_addr))
+        , files(std::move(files))
+        , should_stop(should_stop) {
+    }
 
     std::string get_param(const std::string & key, const std::string & def = "") const {
         auto it = params.find(key);

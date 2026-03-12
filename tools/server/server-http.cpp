@@ -465,6 +465,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
             req.path,
             build_query_string(req),
             req.body,
+            req.remote_addr,
             {},
             req.is_connection_closed
         });
@@ -512,6 +513,7 @@ void server_http_context::post(const std::string & path, const server_http_conte
             req.path,
             build_query_string(req),
             body,
+            req.remote_addr,
             std::move(files),
             req.is_connection_closed
         });
@@ -667,6 +669,7 @@ void server_http_context::register_gcp_compat() {
                         path_prefix + dispatch_path,
                         req.query_string,
                         payload.dump(),
+                        req.remote_addr,
                         {},
                         req.should_stop,
                     };
